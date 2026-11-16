@@ -1,0 +1,8 @@
+{
+  "name": "ระบบบัญชีรายงานวัสดุประจำปี",
+  "description": "โปรแกรมแบบบัญชีรายงานวัสดุประจำปี แยกหมวดหมู่ชัดเจน ติดตามจำนวนคงเหลือและต้นทุนอัตโนมัติ คำนวณค่าเสื่อมราคาแบบเส้นตรงรายปี แจ้งเตือนวัสดุใกล้หมด เชื่อมต่อ Google Sheets และส่งออก PDF/Excel",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
