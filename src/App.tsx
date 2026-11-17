@@ -7,11 +7,16 @@ import { useEffect, useMemo, useState } from 'react';
 import { User } from 'firebase/auth';
 import {
   AlertTriangle,
+  Check,
+  Copy,
+  DatabaseBackup,
+  ExternalLink,
   FileDown,
   Menu,
   Plus,
   Printer,
 } from 'lucide-react';
+import firebaseConfig from '../firebase-applet-config.json';
 import {
   AgencyProfile,
   AppView,
@@ -36,6 +41,12 @@ import {
   exportRequisitionToExcel,
   exportStockCardToExcel,
 } from './utils/exportExcel';
+import {
+  buildBackupPayload,
+  downloadBackupJson,
+  InventoryBackupPayload,
+  mergeBackupDatasets,
+} from './utils/backupJson';
 import { buildStockCardRows } from './utils/stockCard';
 import { AuditDocId, buildAuditDocumentData } from './utils/auditReports';
 import {
@@ -55,6 +66,7 @@ import { StockMovementModal } from './components/StockMovementModal';
 import { ConfirmModal } from './components/ConfirmModal';
 import { OfficialPrintReport } from './components/OfficialPrintReport';
 import { CategorySettingsModal } from './components/CategorySettingsModal';
+import { BackupRestoreModal } from './components/BackupRestoreModal';
 import {
   CategorySummaryReportView,
   PrintableCategorySummaryDocument,
@@ -80,6 +92,7 @@ const STORAGE_KEYS = {
   movements: 'thai_material_ledger_movements_v1',
   categories: 'thai_material_ledger_categories_v1',
   requisitions: 'thai_material_ledger_requisitions_v1',
+  lastBackup: 'thai_material_ledger_last_backup_v1',
 };
 
 function loadFromStorage<T>(key: string, fallback: T): T {
@@ -131,6 +144,8 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [unauthorizedDomain, setUnauthorizedDomain] = useState<string | null>(null);
+  const [copiedDomain, setCopiedDomain] = useState(false);
 
   // Modals
   const [formOpen, setFormOpen] = useState(false);
@@ -162,6 +177,14 @@ export default function App() {
     | 'audit_bundle'
   >('ledger');
   const [categorySettingsOpen, setCategorySettingsOpen] = useState(false);
+  const [backupModalOpen, setBackupModalOpen] = useState(false);
+  const [lastBackupAt, setLastBackupAt] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(STORAGE_KEYS.lastBackup);
+    } catch {
+      return null;
+    }
+  });
 
   useEffect(() => {
     try {
@@ -280,6 +303,8 @@ export default function App() {
   const handleGoogleLogin = async () => {
     setIsLoggingIn(true);
     setAuthError(null);
+    setUnauthorizedDomain(null);
+    setCopiedDomain(false);
     try {
       const res = await googleSignIn();
       if (res) {
@@ -287,9 +312,38 @@ export default function App() {
         setNeedsAuth(false);
       }
     } catch (err: unknown) {
-      const msg =
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code || '')
+          : '';
+      const rawMsg =
         err instanceof Error ? err.message : 'ไม่สามารถเข้าสู่ระบบด้วย Google ได้';
-      setAuthError(msg);
+
+      if (
+        code === 'auth/unauthorized-domain' ||
+        rawMsg.includes('unauthorized-domain')
+      ) {
+        const host =
+          typeof window !== 'undefined' ? window.location.hostname : '';
+        setUnauthorizedDomain(host);
+        setAuthError(
+          `โดเมน "${host}" ยังไม่ได้รับอนุญาตให้เข้าสู่ระบบใน Firebase Authentication`
+        );
+      } else if (
+        code === 'auth/popup-blocked' ||
+        rawMsg.includes('popup-blocked')
+      ) {
+        setAuthError(
+          'เบราว์เซอร์บล็อกหน้าต่างเข้าสู่ระบบ (Pop-up) กรุณาอนุญาต Pop-up สำหรับเว็บไซต์นี้แล้วลองใหม่อีกครั้ง'
+        );
+      } else if (
+        code === 'auth/popup-closed-by-user' ||
+        rawMsg.includes('popup-closed-by-user')
+      ) {
+        setAuthError('คุณได้ปิดหน้าต่างเข้าสู่ระบบ Google ก่อนดำเนินการเสร็จสิ้น');
+      } else {
+        setAuthError(rawMsg);
+      }
     } finally {
       setIsLoggingIn(false);
     }
@@ -598,6 +652,68 @@ export default function App() {
     });
   };
 
+  const handleDownloadBackupJson = (): string => {
+    const payload = buildBackupPayload({
+      agency,
+      categories,
+      materials,
+      movements,
+      requisitions,
+    });
+    const filename = downloadBackupJson(payload);
+    const nowIso = new Date().toISOString();
+    setLastBackupAt(nowIso);
+    try {
+      localStorage.setItem(STORAGE_KEYS.lastBackup, nowIso);
+    } catch {
+      // ignore storage quota errors
+    }
+    return filename;
+  };
+
+  const handleRestoreBackupJson = (
+    payload: InventoryBackupPayload,
+    mode: 'replace' | 'merge'
+  ): { message: string } => {
+    if (mode === 'replace') {
+      const next = payload.data;
+      setAgency(next.agency);
+      setCategories(next.categories);
+      setMaterials(next.materials);
+      setMovements(next.movements);
+      setRequisitions(next.requisitions);
+      setSelectedCategory('all');
+      setSelectedVoucherId(next.requisitions[0]?.id || '');
+      setSelectedStockCardId(
+        next.materials.find((m) => !m.isPriceVariant)?.id ||
+          next.materials[0]?.id ||
+          ''
+      );
+      return {
+        message: `กู้คืนข้อมูลทั้งหมดเรียบร้อยแล้ว (${next.materials.length} รายการวัสดุ, ${next.movements.length} ประวัติรับ-จ่าย, ${next.requisitions.length} ใบเบิก)`,
+      };
+    }
+
+    const result = mergeBackupDatasets(
+      {
+        agency,
+        categories,
+        materials,
+        movements,
+        requisitions,
+      },
+      payload.data
+    );
+    setCategories(result.merged.categories);
+    setMaterials(result.merged.materials);
+    setMovements(result.merged.movements);
+    setRequisitions(result.merged.requisitions);
+
+    return {
+      message: `ผสานข้อมูลเรียบร้อยแล้ว: เพิ่มวัสดุใหม่ ${result.addedMaterials} รายการ, ประเภท ${result.addedCategories} หมวด, ประวัติรับ-จ่าย ${result.addedMovements} รายการ และใบเบิก ${result.addedRequisitions} ใบ`,
+    };
+  };
+
   const viewTitles: Record<AppView, string> = {
     overview: 'ภาพรวมและสรุปยอดประจำปี',
     ledger: 'แบบบัญชีรายงานวัสดุประจำปี',
@@ -620,6 +736,7 @@ export default function App() {
           activeView={activeView}
           onSelectView={setActiveView}
           onOpenCategorySettings={() => setCategorySettingsOpen(true)}
+          onOpenBackupRestore={() => setBackupModalOpen(true)}
           agency={agency}
           alertCount={alertCount}
           sheetsConnected={!needsAuth && Boolean(user)}
@@ -661,6 +778,16 @@ export default function App() {
                   ใกล้หมด {alertCount} รายการ
                 </button>
               )}
+
+              <button
+                type="button"
+                onClick={() => setBackupModalOpen(true)}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+                title="สำรองและนำข้อมูลกลับมาใช้แบบไฟล์ .json"
+              >
+                <DatabaseBackup className="h-3.5 w-3.5 text-teal-700" />
+                <span className="hidden xl:inline">สำรอง .json</span>
+              </button>
 
               <button
                 type="button"
@@ -746,8 +873,63 @@ export default function App() {
 
           <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto space-y-6">
             {authError && (
-              <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-xs text-red-700">
-                {authError}
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-800 space-y-2.5">
+                <div className="font-semibold text-red-900">{authError}</div>
+                {unauthorizedDomain && (
+                  <div className="rounded-lg border border-red-200 bg-white p-3 text-slate-700 space-y-2">
+                    <div className="font-medium text-slate-900">
+                      วิธีแก้ไข: เพิ่มโดเมนด้านล่างใน Firebase Console (Authorized domains)
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <code className="rounded border border-slate-200 bg-slate-50 px-2.5 py-1 font-mono-tabular text-[11px] text-slate-900 select-all">
+                        {unauthorizedDomain}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            await navigator.clipboard.writeText(unauthorizedDomain);
+                            setCopiedDomain(true);
+                            setTimeout(() => setCopiedDomain(false), 2000);
+                          } catch {
+                            // clipboard fallback ignored
+                          }
+                        }}
+                        className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                      >
+                        {copiedDomain ? (
+                          <>
+                            <Check className="h-3 w-3 text-emerald-600" />
+                            คัดลอกแล้ว
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3 w-3" />
+                            คัดลอกโดเมน
+                          </>
+                        )}
+                      </button>
+                      <a
+                        href={`https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/settings`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 rounded-md bg-teal-700 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-teal-800"
+                      >
+                        เปิดตั้งค่า Firebase Console
+                        <ExternalLink className="h-3 w-3" />
+                      </a>
+                    </div>
+                    <ol className="list-decimal pl-4 space-y-0.5 text-[11px] text-slate-600">
+                      <li>
+                        เปิดหน้า <strong>Firebase Console &rarr; Authentication &rarr; Settings &rarr; Authorized domains</strong>
+                      </li>
+                      <li>
+                        กดปุ่ม <strong>Add domain</strong> แล้ววางโดเมน <code className="font-mono-tabular">{unauthorizedDomain}</code> ลงไป จากนั้นกด <strong>Add</strong>
+                      </li>
+                      <li>กลับมาที่หน้านี้แล้วกดปุ่ม <strong>Sign in with Google</strong> อีกครั้ง</li>
+                    </ol>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1059,6 +1241,22 @@ export default function App() {
         tone="danger"
         onConfirm={handleConfirmDeleteVoucher}
         onCancel={() => setDeleteVoucherTarget(null)}
+      />
+
+      {/* JSON Backup & Restore Modal */}
+      <BackupRestoreModal
+        open={backupModalOpen}
+        currentData={{
+          agency,
+          categories,
+          materials,
+          movements,
+          requisitions,
+        }}
+        lastBackupAt={lastBackupAt}
+        onDownloadBackup={handleDownloadBackupJson}
+        onRestoreBackup={handleRestoreBackupJson}
+        onClose={() => setBackupModalOpen(false)}
       />
     </div>
   );

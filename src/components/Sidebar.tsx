@@ -4,6 +4,7 @@ import {
   BarChart3,
   BookOpen,
   ClipboardList,
+  DatabaseBackup,
   FileCheck2,
   Files,
   FileSpreadsheet,
@@ -18,6 +19,7 @@ interface SidebarProps {
   activeView: AppView;
   onSelectView: (view: AppView) => void;
   onOpenCategorySettings: () => void;
+  onOpenBackupRestore: () => void;
   agency: AgencyProfile;
   alertCount: number;
   sheetsConnected: boolean;
@@ -29,6 +31,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   activeView,
   onSelectView,
   onOpenCategorySettings,
+  onOpenBackupRestore,
   agency,
   alertCount,
   sheetsConnected,
@@ -155,7 +158,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             );
           })}
 
-          <div className="pt-2 mt-2 border-t border-slate-100">
+          <div className="pt-2 mt-2 border-t border-slate-100 space-y-1">
             <button
               type="button"
               onClick={() => {
@@ -166,6 +169,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
             >
               <Settings2 className="h-4 w-4 shrink-0 text-slate-400" />
               <span className="truncate">ตั้งค่าประเภทวัสดุ</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onOpenBackupRestore();
+                onCloseMobile();
+              }}
+              className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm font-medium text-slate-600 hover:bg-slate-50 hover:text-slate-900 transition-colors whitespace-nowrap"
+            >
+              <DatabaseBackup className="h-4 w-4 shrink-0 text-slate-400" />
+              <span className="truncate">สำรอง / กู้คืน (.json)</span>
             </button>
           </div>
         </nav>
