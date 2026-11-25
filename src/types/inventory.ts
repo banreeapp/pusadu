@@ -189,3 +189,14 @@ export interface SheetsSyncStatus {
   errorMessage?: string;
 }
 
+export interface SheetsDatabaseConfig {
+  spreadsheetId: string;
+  spreadsheetUrl: string;
+  spreadsheetTitle: string;
+  selectedTab: string;
+  availableTabs: Array<{ sheetId: number; title: string }>;
+  isLocked: boolean;
+  autoSaveEnabled: boolean;
+  intervalSeconds: number;
+}
+

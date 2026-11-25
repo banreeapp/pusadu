@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { User } from 'firebase/auth';
 import {
   AlertTriangle,
@@ -25,6 +25,7 @@ import {
   MaterialCategory,
   MaterialEntry,
   RequisitionVoucher,
+  SheetsDatabaseConfig,
   SheetsSyncStatus,
   StockMovement,
 } from './types/inventory';
@@ -51,11 +52,16 @@ import {
 import { buildStockCardRows } from './utils/stockCard';
 import { AuditDocId, buildAuditDocumentData } from './utils/auditReports';
 import {
+  clearAccessToken,
   getAccessToken,
   googleSignIn,
   initAuth,
   logout,
 } from './services/googleAuth';
+import {
+  GoogleSheetsApiError,
+  updateExistingSheet,
+} from './services/googleSheets';
 import { Sidebar } from './components/Sidebar';
 import { DashboardOverview } from './components/DashboardOverview';
 import { MaterialLedgerTable } from './components/MaterialLedgerTable';
@@ -96,6 +102,18 @@ const STORAGE_KEYS = {
   requisitions: 'thai_material_ledger_requisitions_v1',
   lastBackup: 'thai_material_ledger_last_backup_v1',
   sheetsSync: 'thai_material_ledger_sheets_sync_v1',
+  sheetsDbConfig: 'thai_material_ledger_sheets_db_config_v1',
+};
+
+const DEFAULT_SHEETS_DB_CONFIG: SheetsDatabaseConfig = {
+  spreadsheetId: '',
+  spreadsheetUrl: '',
+  spreadsheetTitle: '',
+  selectedTab: '',
+  availableTabs: [],
+  isLocked: false,
+  autoSaveEnabled: false,
+  intervalSeconds: 60,
 };
 
 function loadFromStorage<T>(key: string, fallback: T): T {
@@ -204,6 +222,27 @@ export default function App() {
     };
   });
 
+  const [sheetsDbConfig, setSheetsDbConfig] = useState<SheetsDatabaseConfig>(() =>
+    loadFromStorage<SheetsDatabaseConfig>(
+      STORAGE_KEYS.sheetsDbConfig,
+      DEFAULT_SHEETS_DB_CONFIG
+    )
+  );
+  const [countdownSec, setCountdownSec] = useState<number>(60);
+  const [isAutoSaving, setIsAutoSaving] = useState<boolean>(false);
+  const isAutoSavingRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEYS.sheetsDbConfig,
+        JSON.stringify(sheetsDbConfig)
+      );
+    } catch {
+      // ignore quota errors
+    }
+  }, [sheetsDbConfig]);
+
   useEffect(() => {
     try {
       localStorage.setItem(
@@ -286,6 +325,139 @@ export default function App() {
     () => materials.map(computeMaterialRow),
     [materials]
   );
+
+  // Keep latest snapshots in refs for the 60-second auto-save timer
+  const latestSyncContextRef = useRef({
+    agency,
+    computedRows,
+    categories,
+    sheetsDbConfig,
+  });
+  latestSyncContextRef.current = {
+    agency,
+    computedRows,
+    categories,
+    sheetsDbConfig,
+  };
+
+  const performAutoSaveToSheets = useCallback(async () => {
+    if (isAutoSavingRef.current) return;
+    const {
+      agency: curAgency,
+      computedRows: curRows,
+      categories: curCategories,
+      sheetsDbConfig: curDb,
+    } = latestSyncContextRef.current;
+
+    if (
+      !curDb.isLocked ||
+      !curDb.autoSaveEnabled ||
+      !curDb.spreadsheetId ||
+      !curDb.selectedTab
+    ) {
+      return;
+    }
+
+    const token = await getAccessToken();
+    if (!token) {
+      setNeedsAuth(true);
+      setSheetsSync((prev) => ({
+        ...prev,
+        kind: 'error',
+        errorMessage:
+          'สิทธิ์การเชื่อมต่อ Google หมดอายุ กรุณาเข้าสู่ระบบ Google ใหม่อีกครั้ง',
+        message: undefined,
+      }));
+      return;
+    }
+
+    isAutoSavingRef.current = true;
+    setIsAutoSaving(true);
+    setSheetsSync((prev) => ({
+      ...prev,
+      kind: 'syncing',
+      message: `กำลังบันทึกอัตโนมัติลงแท็บ "${curDb.selectedTab}"...`,
+      errorMessage: undefined,
+    }));
+
+    try {
+      const fullCategoryLabel = `ทุกหมวดหมู่ (${curCategories.join('/')})`;
+      await updateExistingSheet(
+        token,
+        curDb.spreadsheetId,
+        curDb.selectedTab,
+        curAgency,
+        curRows,
+        fullCategoryLabel
+      );
+
+      setSheetsSync((prev) => ({
+        ...prev,
+        kind: 'success',
+        lastSyncAt: new Date().toISOString(),
+        lastSyncAction: 'บันทึกอัตโนมัติ (ทุก 60 วินาที)',
+        message: `บันทึกข้อมูล ${curRows.length} รายการลง "${curDb.spreadsheetTitle}" (${curDb.selectedTab}) สำเร็จ`,
+        errorMessage: undefined,
+        spreadsheetTitle: curDb.spreadsheetTitle,
+        spreadsheetUrl: curDb.spreadsheetUrl,
+      }));
+      setCountdownSec(60);
+    } catch (err: unknown) {
+      if (err instanceof GoogleSheetsApiError && err.status === 401) {
+        clearAccessToken();
+        setNeedsAuth(true);
+        setSheetsSync((prev) => ({
+          ...prev,
+          kind: 'error',
+          errorMessage:
+            'สิทธิ์การเชื่อมต่อ Google หมดอายุ กรุณาเข้าสู่ระบบใหม่อีกครั้ง',
+          message: undefined,
+        }));
+      } else {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'เกิดข้อผิดพลาดในการบันทึกอัตโนมัติลง Google Sheets';
+        setSheetsSync((prev) => ({
+          ...prev,
+          kind: 'error',
+          errorMessage: msg,
+          message: undefined,
+        }));
+      }
+      setCountdownSec(60);
+    } finally {
+      isAutoSavingRef.current = false;
+      setIsAutoSaving(false);
+    }
+  }, []);
+
+  const isAutoSaveActive =
+    sheetsDbConfig.isLocked &&
+    sheetsDbConfig.autoSaveEnabled &&
+    Boolean(sheetsDbConfig.spreadsheetId) &&
+    Boolean(sheetsDbConfig.selectedTab) &&
+    !needsAuth &&
+    Boolean(user);
+
+  useEffect(() => {
+    if (!isAutoSaveActive) {
+      setCountdownSec(60);
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setCountdownSec((prev) => {
+        if (prev <= 1) {
+          void performAutoSaveToSheets();
+          return 60;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [isAutoSaveActive, performAutoSaveToSheets]);
 
   const activeVoucher = useMemo(
     () =>
@@ -928,8 +1100,11 @@ export default function App() {
             isConnected={!needsAuth && Boolean(user)}
             userEmail={user?.email}
             syncStatus={sheetsSync}
+            dbConfig={sheetsDbConfig}
+            countdownSec={countdownSec}
             activeView={activeView}
             onNavigateToSheets={() => setActiveView('sheets')}
+            onTriggerManualSave={() => void performAutoSaveToSheets()}
             onClearStatusAlert={() =>
               setSheetsSync((prev) => ({
                 ...prev,
@@ -1159,8 +1334,14 @@ export default function App() {
                 onRequireReauth={() => setNeedsAuth(true)}
                 agency={agency}
                 rows={exportRows}
+                allRows={computedRows}
                 categories={categories}
                 selectedCategory={selectedCategory}
+                dbConfig={sheetsDbConfig}
+                onUpdateDbConfig={setSheetsDbConfig}
+                countdownSec={countdownSec}
+                isAutoSaving={isAutoSaving}
+                onTriggerSaveNow={performAutoSaveToSheets}
                 onImportEntries={(imported, mode) => {
                   const importedCats = Array.from(
                     new Set(imported.map((item) => item.category).filter(Boolean))

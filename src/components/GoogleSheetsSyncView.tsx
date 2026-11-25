@@ -1,13 +1,18 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { User } from 'firebase/auth';
 import {
   CheckCircle2,
+  Clock,
+  Database,
   Download,
   ExternalLink,
   FileSpreadsheet,
   FolderSearch,
+  Lock,
   LogOut,
   RefreshCw,
+  Save,
+  Unlock,
   Upload,
 } from 'lucide-react';
 import {
@@ -15,12 +20,14 @@ import {
   ComputedMaterialRow,
   MaterialCategory,
   MaterialEntry,
+  SheetsDatabaseConfig,
 } from '../types/inventory';
 import {
   createAndExportLedgerSheet,
+  extractSpreadsheetId,
   getSpreadsheetMetadata,
+  GoogleSheetsApiError,
   importFromGoogleSheet,
-  SpreadsheetMetadata,
   updateExistingSheet,
 } from '../services/googleSheets';
 import { ConfirmModal } from './ConfirmModal';
@@ -35,8 +42,18 @@ interface GoogleSheetsSyncViewProps {
   onRequireReauth: () => void;
   agency: AgencyProfile;
   rows: ComputedMaterialRow[];
+  allRows: ComputedMaterialRow[];
   categories: string[];
   selectedCategory: MaterialCategory | 'all';
+  dbConfig: SheetsDatabaseConfig;
+  onUpdateDbConfig: (
+    updater:
+      | SheetsDatabaseConfig
+      | ((prev: SheetsDatabaseConfig) => SheetsDatabaseConfig)
+  ) => void;
+  countdownSec: number;
+  isAutoSaving: boolean;
+  onTriggerSaveNow: () => Promise<void>;
   onImportEntries: (entries: MaterialEntry[], mode: 'merge' | 'replace') => void;
   onSyncStart: (message: string) => void;
   onSyncSuccess: (info: {
@@ -59,17 +76,23 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
   onRequireReauth,
   agency,
   rows,
+  allRows,
   categories,
   selectedCategory,
+  dbConfig,
+  onUpdateDbConfig,
+  countdownSec,
+  isAutoSaving,
+  onTriggerSaveNow,
   onImportEntries,
   onSyncStart,
   onSyncSuccess,
   onSyncError,
   onSheetLinked,
 }) => {
-  const [sheetUrlOrId, setSheetUrlOrId] = useState('');
-  const [metadata, setMetadata] = useState<SpreadsheetMetadata | null>(null);
-  const [selectedTab, setSelectedTab] = useState('');
+  const [sheetUrlInput, setSheetUrlInput] = useState(
+    dbConfig.spreadsheetUrl || dbConfig.spreadsheetId || ''
+  );
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<{
     type: 'success' | 'error';
@@ -77,6 +100,7 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
     link?: string;
   } | null>(null);
 
+  const [confirmLockOpen, setConfirmLockOpen] = useState(false);
   const [confirmOverwriteOpen, setConfirmOverwriteOpen] = useState(false);
   const [importedPreview, setImportedPreview] = useState<MaterialEntry[] | null>(
     null
@@ -84,10 +108,18 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
   const [confirmImportOpen, setConfirmImportOpen] = useState(false);
   const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge');
 
+  useEffect(() => {
+    if (dbConfig.spreadsheetUrl && dbConfig.spreadsheetUrl !== sheetUrlInput) {
+      setSheetUrlInput(dbConfig.spreadsheetUrl);
+    }
+  }, [dbConfig.spreadsheetUrl]);
+
   const categoryLabel =
     selectedCategory === 'all'
       ? `ทุกหมวดหมู่ (${categories.join('/')})`
       : selectedCategory;
+
+  const hasLinkedSheet = Boolean(dbConfig.spreadsheetId && dbConfig.selectedTab);
 
   const ensureToken = async (): Promise<string | null> => {
     const token = await getToken();
@@ -105,52 +137,71 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
     return token;
   };
 
+  const handleApiError = (err: unknown, fallback: string) => {
+    if (err instanceof GoogleSheetsApiError && err.status === 401) {
+      onRequireReauth();
+      const msg = 'สิทธิ์การเชื่อมต่อ Google หมดอายุ กรุณาเข้าสู่ระบบ Google ใหม่อีกครั้ง';
+      setStatusMessage({ type: 'error', text: msg });
+      onSyncError(msg);
+      return;
+    }
+    const message = err instanceof Error ? err.message : fallback;
+    setStatusMessage({ type: 'error', text: message });
+    onSyncError(message);
+  };
+
   const handleCreateNewSheet = async () => {
+    if (dbConfig.isLocked) return;
     const token = await ensureToken();
     if (!token) return;
 
     setBusyAction('create');
     setStatusMessage(null);
-    onSyncStart('กำลังสร้างสเปรดชีตใหม่และส่งออกข้อมูล...');
+    onSyncStart('กำลังสร้างไฟล์ฐานข้อมูล Google Sheets ใหม่...');
     try {
       const result = await createAndExportLedgerSheet(
         token,
         agency,
-        rows,
-        categoryLabel
+        allRows,
+        `ทุกหมวดหมู่ (${categories.join('/')})`
       );
-      setSheetUrlOrId(result.spreadsheetUrl);
-      const successText = `สร้างสเปรดชีต "${result.title}" และส่งออกข้อมูล ${rows.length} รายการเรียบร้อยแล้ว`;
+      setSheetUrlInput(result.spreadsheetUrl);
+      onUpdateDbConfig((prev) => ({
+        ...prev,
+        spreadsheetId: result.spreadsheetId,
+        spreadsheetUrl: result.spreadsheetUrl,
+        spreadsheetTitle: result.title,
+        selectedTab: 'แบบบัญชีวัสดุประจำปี',
+        availableTabs: [
+          { sheetId: 0, title: 'แบบบัญชีวัสดุประจำปี' },
+          { sheetId: 1, title: 'ค่าเสื่อมราคาเส้นตรง' },
+        ],
+      }));
+
+      const successText = `สร้างฐานข้อมูล "${result.title}" และส่งออกข้อมูล ${allRows.length} รายการเรียบร้อยแล้ว (พร้อมล็อคการตั้งค่า)`;
       setStatusMessage({
         type: 'success',
         text: successText,
         link: result.spreadsheetUrl,
       });
       onSyncSuccess({
-        action: 'สร้างและส่งออก Google Sheets',
+        action: 'สร้างฐานข้อมูล Google Sheets ใหม่',
         message: successText,
         spreadsheetTitle: result.title,
         spreadsheetUrl: result.spreadsheetUrl,
       });
     } catch (err: unknown) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'เกิดข้อผิดพลาดในการสร้าง Google Sheet';
-      setStatusMessage({ type: 'error', text: message });
-      onSyncError(message);
+      handleApiError(err, 'เกิดข้อผิดพลาดในการสร้าง Google Sheet');
     } finally {
       setBusyAction(null);
     }
   };
 
   const handleLoadMetadata = async () => {
-    if (!sheetUrlOrId.trim()) {
+    if (dbConfig.isLocked) return;
+    if (!sheetUrlInput.trim()) {
       const msg = 'กรุณาวางลิงก์ Google Sheets หรือรหัส Spreadsheet ID';
-      setStatusMessage({
-        type: 'error',
-        text: msg,
-      });
+      setStatusMessage({ type: 'error', text: msg });
       onSyncError(msg);
       return;
     }
@@ -159,119 +210,143 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
 
     setBusyAction('inspect');
     setStatusMessage(null);
-    onSyncStart('กำลังตรวจสอบโครงสร้างไฟล์ Google Sheets...');
+    onSyncStart('กำลังตรวจสอบการเชื่อมต่อไฟล์ Google Sheets...');
     try {
-      const meta = await getSpreadsheetMetadata(token, sheetUrlOrId);
-      setMetadata(meta);
-      setSelectedTab(meta.sheets[0]?.title || '');
+      const meta = await getSpreadsheetMetadata(token, sheetUrlInput);
+      const defaultTab =
+        meta.sheets.find((s) => s.title === dbConfig.selectedTab)?.title ||
+        meta.sheets[0]?.title ||
+        '';
+      setSheetUrlInput(meta.spreadsheetUrl);
+      onUpdateDbConfig((prev) => ({
+        ...prev,
+        spreadsheetId: meta.spreadsheetId,
+        spreadsheetUrl: meta.spreadsheetUrl,
+        spreadsheetTitle: meta.title,
+        availableTabs: meta.sheets,
+        selectedTab: defaultTab,
+      }));
+
       setStatusMessage({
         type: 'success',
-        text: `พบสเปรดชีต "${meta.title}" (${meta.sheets.length} แท็บ)`,
+        text: `เชื่อมต่อไฟล์ "${meta.title}" สำเร็จ (${meta.sheets.length} แท็บ) — สามารถกด "ล็อคการตั้งค่า" ได้ทันที`,
         link: meta.spreadsheetUrl,
       });
       onSheetLinked(meta.title, meta.spreadsheetUrl);
     } catch (err: unknown) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'ไม่สามารถอ่านข้อมูลสเปรดชีตได้';
-      setStatusMessage({ type: 'error', text: message });
-      onSyncError(message);
-      setMetadata(null);
+      handleApiError(err, 'ไม่สามารถอ่านข้อมูลสเปรดชีตได้');
     } finally {
       setBusyAction(null);
     }
   };
 
+  const handleConfirmLockSettings = async () => {
+    if (!hasLinkedSheet) return;
+    setConfirmLockOpen(false);
+    onUpdateDbConfig((prev) => ({
+      ...prev,
+      isLocked: true,
+      autoSaveEnabled: true,
+      intervalSeconds: 60,
+    }));
+    await onTriggerSaveNow();
+  };
+
+  const handleUnlockSettings = () => {
+    onUpdateDbConfig((prev) => ({
+      ...prev,
+      isLocked: false,
+      autoSaveEnabled: false,
+    }));
+    setStatusMessage({
+      type: 'success',
+      text: 'ปลดล็อคการตั้งค่าและหยุดการบันทึกอัตโนมัติทุก 60 วินาทีแล้ว',
+    });
+  };
+
   const handleConfirmedOverwrite = async () => {
-    if (!metadata || !selectedTab) return;
+    if (!dbConfig.spreadsheetId || !dbConfig.selectedTab) return;
     const token = await ensureToken();
     if (!token) return;
 
     setBusyAction('overwrite');
     setStatusMessage(null);
-    onSyncStart(`กำลังอัปเดตข้อมูลลงแท็บ "${selectedTab}"...`);
+    onSyncStart(`กำลังอัปเดตข้อมูลลงแท็บ "${dbConfig.selectedTab}"...`);
     try {
       await updateExistingSheet(
         token,
-        metadata.spreadsheetId,
-        selectedTab,
+        dbConfig.spreadsheetId,
+        dbConfig.selectedTab,
         agency,
         rows,
         categoryLabel
       );
       setConfirmOverwriteOpen(false);
-      const successText = `อัปเดตข้อมูลบัญชีวัสดุ (${rows.length} รายการ) ลงในแท็บ "${selectedTab}" ของ "${metadata.title}" สำเร็จแล้ว`;
+      const successText = `อัปเดตข้อมูลบัญชีวัสดุ (${rows.length} รายการ) ลงในแท็บ "${dbConfig.selectedTab}" ของ "${dbConfig.spreadsheetTitle}" สำเร็จแล้ว`;
       setStatusMessage({
         type: 'success',
         text: successText,
-        link: metadata.spreadsheetUrl,
+        link: dbConfig.spreadsheetUrl,
       });
       onSyncSuccess({
         action: 'อัปเดตข้อมูลลง Google Sheets',
         message: successText,
-        spreadsheetTitle: metadata.title,
-        spreadsheetUrl: metadata.spreadsheetUrl,
+        spreadsheetTitle: dbConfig.spreadsheetTitle,
+        spreadsheetUrl: dbConfig.spreadsheetUrl,
       });
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : 'ไม่สามารถอัปเดต Google Sheet ได้';
-      setStatusMessage({ type: 'error', text: message });
-      onSyncError(message);
+      handleApiError(err, 'ไม่สามารถอัปเดต Google Sheet ได้');
     } finally {
       setBusyAction(null);
     }
   };
 
   const handlePreviewImport = async () => {
-    if (!metadata || !selectedTab) return;
+    if (!dbConfig.spreadsheetId || !dbConfig.selectedTab) return;
     const token = await ensureToken();
     if (!token) return;
 
     setBusyAction('import');
     setStatusMessage(null);
-    onSyncStart(`กำลังดึงข้อมูลจากแท็บ "${selectedTab}"...`);
+    onSyncStart(`กำลังดึงข้อมูลจากแท็บ "${dbConfig.selectedTab}"...`);
     try {
       const parsed = await importFromGoogleSheet(
         token,
-        metadata.spreadsheetId,
-        selectedTab
+        dbConfig.spreadsheetId,
+        dbConfig.selectedTab
       );
       if (parsed.length === 0) {
-        const msg = `ไม่พบแถวรายการวัสดุในแท็บ "${selectedTab}" กรุณาตรวจสอบหัวตาราง (รหัสวัสดุ, รายการ)`;
-        setStatusMessage({
-          type: 'error',
-          text: msg,
-        });
+        const msg = `ไม่พบแถวรายการวัสดุในแท็บ "${dbConfig.selectedTab}" กรุณาตรวจสอบหัวตาราง (รหัสวัสดุ, รายการ)`;
+        setStatusMessage({ type: 'error', text: msg });
         onSyncError(msg);
       } else {
         setImportedPreview(parsed);
         setConfirmImportOpen(true);
-        onSheetLinked(metadata.title, metadata.spreadsheetUrl);
+        onSheetLinked(dbConfig.spreadsheetTitle, dbConfig.spreadsheetUrl);
       }
     } catch (err: unknown) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'ไม่สามารถนำเข้าข้อมูลจาก Google Sheet ได้';
-      setStatusMessage({ type: 'error', text: message });
-      onSyncError(message);
+      handleApiError(err, 'ไม่สามารถนำเข้าข้อมูลจาก Google Sheet ได้');
     } finally {
       setBusyAction(null);
     }
   };
 
+  const inputSpreadsheetIdPreview = extractSpreadsheetId(sheetUrlInput);
+
   return (
     <div className="space-y-6">
-      {/* Authentication Card */}
+      {/* Step 1: Google Login Card */}
       <div className="rounded-xl border border-slate-200 bg-white p-6">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="space-y-1">
+            <div className="text-xs font-semibold text-teal-700">
+              ขั้นตอนที่ 1 · ยืนยันตัวตนบัญชี Google
+            </div>
             <h2 className="text-base font-semibold text-slate-900">
-              เชื่อมต่อบัญชี Google Sheets
+              เข้าสู่ระบบบัญชี Google สำหรับเข้าถึง Google Sheets
             </h2>
             <p className="text-xs text-slate-500">
-              ส่งออกแบบบัญชีรายงานวัสดุประจำปี (เอกสารหมายเลข 1) และตารางค่าเสื่อมราคาไปยัง Google Sheets ของคุณโดยตรง หรือดึงข้อมูลจากชีตที่มีอยู่
+              ใช้สิทธิ์เฉพาะการอ่าน-เขียนไฟล์ Google Sheets ของคุณ เพื่อเชื่อมต่อฐานข้อมูลและบันทึกข้อมูลอัตโนมัติ
             </p>
           </div>
 
@@ -311,7 +386,7 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
                   </svg>
                 </div>
                 <span className="gsi-material-button-contents">
-                  {isLoggingIn ? 'กำลังเชื่อมต่อ...' : 'Sign in with Google'}
+                  {isLoggingIn ? 'กำลังเข้าสู่ระบบ...' : 'Sign in with Google'}
                 </span>
               </div>
             </button>
@@ -321,7 +396,9 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
                 <div className="text-xs font-semibold text-slate-900">
                   {user.displayName || 'บัญชี Google'}
                 </div>
-                <div className="text-[11px] text-slate-500">{user.email}</div>
+                <div className="text-[11px] text-emerald-700 font-medium">
+                  {user.email} · พร้อมซิงค์ข้อมูล
+                </div>
               </div>
               <button
                 type="button"
@@ -362,148 +439,304 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
         </div>
       )}
 
-      {/* Two-Column Action Workspace */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        {/* Option 1: Create New Spreadsheet */}
-        <div className="rounded-xl border border-slate-200 bg-white p-6 flex flex-col justify-between space-y-4">
-          <div className="space-y-2">
-            <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-              <FileSpreadsheet className="h-4 w-4 text-teal-700" />
-              สร้างสเปรดชีตใหม่พร้อมส่งออกรายงานทันที
-            </div>
-            <p className="text-xs text-slate-500 leading-relaxed">
-              ระบบจะสร้างไฟล์ Google Sheets ใหม่ในบัญชีของคุณ พร้อมจัดวางแท็บ{' '}
-              <strong className="text-slate-700">แบบบัญชีวัสดุประจำปี</strong> (เอกสารหมายเลข 1)
-              และแท็บ{' '}
-              <strong className="text-slate-700">ค่าเสื่อมราคาเส้นตรง</strong> ให้อัตโนมัติ
-            </p>
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600 space-y-1">
-              <div>
-                หน่วยงาน: <strong className="text-slate-800">{agency.agencyName}</strong>
-              </div>
-              <div>
-                จำนวนรายการที่ส่งออก:{' '}
-                <strong className="font-mono-tabular text-slate-800">
-                  {rows.length} แถว
-                </strong>{' '}
-                · ปีงบประมาณ พ.ศ. {agency.fiscalYearBE}
-              </div>
-            </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={handleCreateNewSheet}
-            disabled={needsAuth || busyAction !== null}
-            className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-medium text-white hover:bg-teal-800 disabled:opacity-50"
-          >
-            <Upload className="h-4 w-4" />
-            {busyAction === 'create'
-              ? 'กำลังสร้าง Google Sheet...'
-              : 'สร้าง Google Sheet ใหม่และส่งออก'}
-          </button>
-        </div>
-
-        {/* Option 2: Connect Existing Spreadsheet */}
-        <div className="rounded-xl border border-slate-200 bg-white p-6 space-y-4">
+      {/* Step 2: Database Connection + Lock Settings + 60s Auto-Save */}
+      <div
+        className={`rounded-xl border p-6 space-y-5 transition-colors ${
+          dbConfig.isLocked
+            ? 'border-teal-300 bg-teal-50/30'
+            : 'border-slate-200 bg-white'
+        }`}
+      >
+        <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="space-y-1">
-            <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-              <FolderSearch className="h-4 w-4 text-teal-700" />
-              เชื่อมโยงสเปรดชีตที่มีอยู่ (อัปเดต / นำเข้า)
+            <div className="flex items-center gap-2 text-xs font-semibold text-teal-700">
+              <Database className="h-3.5 w-3.5" />
+              ขั้นตอนที่ 2 · ตั้งค่าเชื่อมต่อฐานข้อมูล Google Sheets และล็อคการตั้งค่า
             </div>
+            <h3 className="text-base font-semibold text-slate-900">
+              กำหนดสเปรดชีตฐานข้อมูลและบันทึกอัตโนมัติทุก 60 วินาที
+            </h3>
             <p className="text-xs text-slate-500">
-              วาง URL ของ Google Sheets หรือ Spreadsheet ID เพื่อตรวจสอบรายชื่อแท็บในไฟล์จริง
+              เชื่อมต่อไฟล์ Google Sheets ที่ต้องการใช้เป็นฐานข้อมูล จากนั้นกด{' '}
+              <strong className="text-slate-700">ล็อคการตั้งค่า</strong>{' '}
+              เพื่อป้องกันการแก้ไขเป้าหมายและให้ระบบบันทึกข้อมูลล่าสุดลง Sheets ทุก 60 วินาที
             </p>
           </div>
 
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={sheetUrlOrId}
-              onChange={(e) => setSheetUrlOrId(e.target.value)}
-              placeholder="https://docs.google.com/spreadsheets/d/..."
-              className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono-tabular focus:border-teal-600 focus:outline-none"
-            />
+          {dbConfig.isLocked ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void onTriggerSaveNow()}
+                disabled={needsAuth || isAutoSaving || busyAction !== null}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-50"
+              >
+                <Save className="h-3.5 w-3.5" />
+                {isAutoSaving ? 'กำลังบันทึก...' : 'บันทึกลง Sheets ทันที'}
+              </button>
+              <button
+                type="button"
+                onClick={handleUnlockSettings}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-3.5 py-2 text-xs font-semibold text-amber-900 hover:bg-amber-100"
+              >
+                <Unlock className="h-3.5 w-3.5" />
+                ปลดล็อคการตั้งค่า
+              </button>
+            </div>
+          ) : (
             <button
               type="button"
-              onClick={handleLoadMetadata}
-              disabled={needsAuth || busyAction !== null}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap"
+              onClick={() => setConfirmLockOpen(true)}
+              disabled={needsAuth || !hasLinkedSheet || busyAction !== null}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-4 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-50"
             >
-              <RefreshCw
-                className={`h-3.5 w-3.5 ${busyAction === 'inspect' ? 'animate-spin' : ''}`}
-              />
-              ตรวจสอบไฟล์
+              <Lock className="h-3.5 w-3.5" />
+              ล็อคการตั้งค่า (บันทึกทุก 60 วินาที)
             </button>
-          </div>
-
-          {metadata && (
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-3">
-              <div className="flex items-center justify-between gap-2 text-xs">
-                <span className="font-semibold text-slate-900 truncate">
-                  {metadata.title}
-                </span>
-                <a
-                  href={metadata.spreadsheetUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-teal-700 hover:underline whitespace-nowrap"
-                >
-                  เปิดชีต
-                  <ExternalLink className="h-3 w-3" />
-                </a>
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">
-                  เลือกแท็บ (Sheet Tab)
-                </label>
-                <select
-                  value={selectedTab}
-                  onChange={(e) => setSelectedTab(e.target.value)}
-                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs"
-                >
-                  {metadata.sheets.map((s) => (
-                    <option key={s.sheetId} value={s.title}>
-                      {s.title}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 pt-1">
-                <button
-                  type="button"
-                  onClick={() => setConfirmOverwriteOpen(true)}
-                  disabled={!selectedTab || busyAction !== null}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
-                >
-                  <Upload className="h-3.5 w-3.5" />
-                  เขียนอัปเดตลงแท็บนี้
-                </button>
-                <button
-                  type="button"
-                  onClick={handlePreviewImport}
-                  disabled={!selectedTab || busyAction !== null}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  นำเข้าข้อมูลจากแท็บนี้
-                </button>
-              </div>
-            </div>
           )}
         </div>
+
+        {/* Locked Status Banner */}
+        {dbConfig.isLocked && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-teal-200 bg-white px-4 py-3 text-xs">
+            <div className="flex items-center gap-2.5 text-teal-900">
+              <Lock className="h-4 w-4 text-teal-700 shrink-0" />
+              <div>
+                <div className="font-semibold">
+                  ล็อคการตั้งค่าฐานข้อมูลแล้ว — {dbConfig.spreadsheetTitle} (แท็บ:{' '}
+                  {dbConfig.selectedTab})
+                </div>
+                <div className="text-[11px] text-slate-600 mt-0.5">
+                  {needsAuth || !user
+                    ? 'กรุณาเข้าสู่ระบบ Google ด้านบน เพื่อเริ่มการทำงานบันทึกอัตโนมัติทุก 60 วินาที'
+                    : `ระบบบันทึกข้อมูลบัญชีวัสดุทั้งหมด (${allRows.length} รายการ) ลงแท็บ "${dbConfig.selectedTab}" อัตโนมัติทุก 60 วินาที`}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 shrink-0">
+              {!needsAuth && user && dbConfig.autoSaveEnabled && (
+                <div className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 font-mono-tabular text-[11px] font-semibold text-emerald-800">
+                  <Clock className="h-3.5 w-3.5 text-emerald-700" />
+                  {isAutoSaving
+                    ? 'กำลังบันทึกลง Sheets...'
+                    : `บันทึกอัตโนมัติในอีก ${countdownSec} วินาที`}
+                </div>
+              )}
+              {dbConfig.spreadsheetUrl && (
+                <a
+                  href={dbConfig.spreadsheetUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 font-semibold text-teal-700 underline hover:no-underline"
+                >
+                  เปิดไฟล์ฐานข้อมูล
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Target Sheet Inputs (Disabled while locked) */}
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+          {/* Option A: Existing Spreadsheet URL / ID */}
+          <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
+                <FolderSearch className="h-4 w-4 text-teal-700" />
+                เชื่อมต่อไฟล์ Google Sheets ที่มีอยู่
+              </div>
+              {dbConfig.isLocked && (
+                <span className="inline-flex items-center gap-1 text-[11px] font-medium text-teal-700">
+                  <Lock className="h-3 w-3" /> ล็อคอยู่
+                </span>
+              )}
+            </div>
+
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={sheetUrlInput}
+                disabled={dbConfig.isLocked}
+                onChange={(e) => setSheetUrlInput(e.target.value)}
+                placeholder="https://docs.google.com/spreadsheets/d/..."
+                className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono-tabular focus:border-teal-600 focus:outline-none disabled:bg-slate-100 disabled:text-slate-500"
+              />
+              <button
+                type="button"
+                onClick={handleLoadMetadata}
+                disabled={
+                  needsAuth ||
+                  dbConfig.isLocked ||
+                  busyAction !== null ||
+                  !inputSpreadsheetIdPreview
+                }
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap"
+              >
+                <RefreshCw
+                  className={`h-3.5 w-3.5 ${
+                    busyAction === 'inspect' ? 'animate-spin' : ''
+                  }`}
+                />
+                ตรวจสอบไฟล์
+              </button>
+            </div>
+
+            {dbConfig.spreadsheetId && (
+              <div className="space-y-2 pt-1">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className="text-slate-600 truncate">
+                    ชื่อไฟล์:{' '}
+                    <strong className="text-slate-900">
+                      {dbConfig.spreadsheetTitle}
+                    </strong>
+                  </span>
+                  {dbConfig.spreadsheetUrl && (
+                    <a
+                      href={dbConfig.spreadsheetUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-teal-700 hover:underline whitespace-nowrap"
+                    >
+                      เปิดชีต
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  )}
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-700 mb-1">
+                    แท็บฐานข้อมูลปลายทาง (Sheet Tab)
+                  </label>
+                  <select
+                    value={dbConfig.selectedTab}
+                    disabled={dbConfig.isLocked}
+                    onChange={(e) =>
+                      onUpdateDbConfig((prev) => ({
+                        ...prev,
+                        selectedTab: e.target.value,
+                      }))
+                    }
+                    className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs disabled:bg-slate-100 disabled:text-slate-500"
+                  >
+                    {dbConfig.availableTabs.length > 0 ? (
+                      dbConfig.availableTabs.map((s) => (
+                        <option key={s.sheetId} value={s.title}>
+                          {s.title}
+                        </option>
+                      ))
+                    ) : (
+                      <option value={dbConfig.selectedTab}>
+                        {dbConfig.selectedTab}
+                      </option>
+                    )}
+                  </select>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Option B: Create New Google Sheet Database */}
+          <div className="rounded-xl border border-slate-200 bg-white p-4 flex flex-col justify-between space-y-3">
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
+                <FileSpreadsheet className="h-4 w-4 text-teal-700" />
+                หรือสร้างไฟล์ฐานข้อมูล Google Sheets ใหม่
+              </div>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                ระบบจะสร้างสเปรดชีตใหม่ในบัญชี Google ของคุณ พร้อมแท็บ{' '}
+                <strong className="text-slate-700">แบบบัญชีวัสดุประจำปี</strong>{' '}
+                และ{' '}
+                <strong className="text-slate-700">ค่าเสื่อมราคาเส้นตรง</strong>{' '}
+                ให้อัตโนมัติและเชื่อมโยงกับระบบทันที
+              </p>
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                หน่วยงาน: <strong className="text-slate-800">{agency.agencyName}</strong>{' '}
+                · ทั้งหมด{' '}
+                <strong className="font-mono-tabular text-slate-800">
+                  {allRows.length} รายการ
+                </strong>{' '}
+                (พ.ศ. {agency.fiscalYearBE})
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleCreateNewSheet}
+              disabled={needsAuth || dbConfig.isLocked || busyAction !== null}
+              className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-teal-700 bg-white px-4 py-2 text-xs font-semibold text-teal-700 hover:bg-teal-50 disabled:opacity-50"
+            >
+              <Upload className="h-3.5 w-3.5" />
+              {busyAction === 'create'
+                ? 'กำลังสร้าง Google Sheet...'
+                : 'สร้างฐานข้อมูล Google Sheet ใหม่'}
+            </button>
+          </div>
+        </div>
       </div>
+
+      {/* Step 3: Manual Sync / Import Tools */}
+      {hasLinkedSheet && (
+        <div className="rounded-xl border border-slate-200 bg-white p-6 space-y-4">
+          <div className="space-y-1">
+            <div className="text-xs font-semibold text-slate-500">
+              ขั้นตอนที่ 3 · ซิงค์ข้อมูลด้วยตนเอง
+            </div>
+            <h3 className="text-sm font-semibold text-slate-900">
+              เขียนทับหรือดึงข้อมูลจากแท็บ "{dbConfig.selectedTab}" ในไฟล์ "{dbConfig.spreadsheetTitle}"
+            </h3>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setConfirmOverwriteOpen(true)}
+              disabled={needsAuth || !dbConfig.selectedTab || busyAction !== null}
+              className="inline-flex items-center justify-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-2.5 text-xs font-semibold text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+            >
+              <Upload className="h-4 w-4" />
+              เขียนอัปเดตลงแท็บนี้ด้วยตนเอง ({rows.length} แถว)
+            </button>
+            <button
+              type="button"
+              onClick={handlePreviewImport}
+              disabled={needsAuth || !dbConfig.selectedTab || busyAction !== null}
+              className="inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+            >
+              <Download className="h-4 w-4" />
+              นำเข้าข้อมูลจากแท็บนี้เข้าสู่แอป
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Mandatory Confirmation before locking & enabling 60s Auto-Save */}
+      <ConfirmModal
+        open={confirmLockOpen}
+        title="ยืนยันการล็อคการตั้งค่าและบันทึกอัตโนมัติทุก 60 วินาที?"
+        description={`เมื่อยืนยันล็อคการตั้งค่า ระบบจะล็อคการเชื่อมต่อกับสเปรดชีต "${dbConfig.spreadsheetTitle}" และบันทึกข้อมูลบัญชีวัสดุปัจจุบันลงแท็บ "${dbConfig.selectedTab}" อัตโนมัติทุก 60 วินาที`}
+        details={[
+          `ไฟล์ฐานข้อมูล: ${dbConfig.spreadsheetTitle || '-'}`,
+          `แท็บปลายทาง: ${dbConfig.selectedTab || '-'}`,
+          `จำนวนข้อมูลที่จะบันทึก: ${allRows.length} รายการ (ทุกหมวดหมู่)`,
+          'สามารถกด "ปลดล็อคการตั้งค่า" ได้ทุกเมื่อเพื่อหยุดการบันทึกอัตโนมัติหรือเปลี่ยนไฟล์',
+        ]}
+        confirmLabel="ยืนยันล็อคและเปิดบันทึกทุก 60 วิ"
+        cancelLabel="ยกเลิก"
+        tone="warning"
+        onConfirm={() => void handleConfirmLockSettings()}
+        onCancel={() => setConfirmLockOpen(false)}
+      />
 
       {/* Mandatory User Confirmation before mutating existing Google Sheet */}
       <ConfirmModal
         open={confirmOverwriteOpen}
         title="ยืนยันการเขียนทับข้อมูลใน Google Sheets?"
-        description={`ระบบจะล้างข้อมูลเดิมในแท็บ "${selectedTab}" ของสเปรดชีต "${metadata?.title || ''}" และแทนที่ด้วยข้อมูลแบบบัญชีรายงานวัสดุประจำปีชุดปัจจุบัน`}
+        description={`ระบบจะล้างข้อมูลเดิมในแท็บ "${dbConfig.selectedTab}" ของสเปรดชีต "${dbConfig.spreadsheetTitle}" และแทนที่ด้วยข้อมูลแบบบัญชีรายงานวัสดุประจำปีชุดปัจจุบัน`}
         details={[
-          `ไฟล์เป้าหมาย: ${metadata?.title || '-'}`,
-          `แท็บเป้าหมาย: ${selectedTab}`,
+          `ไฟล์เป้าหมาย: ${dbConfig.spreadsheetTitle || '-'}`,
+          `แท็บเป้าหมาย: ${dbConfig.selectedTab}`,
           `จำนวนรายการที่จะเขียนลงชีต: ${rows.length} แถว`,
           'การดำเนินการนี้จะแก้ไขข้อมูลใน Google Sheets ของคุณโดยตรง',
         ]}
@@ -524,7 +757,7 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
         >
           <div className="w-full max-w-lg rounded-xl border border-slate-200 bg-white p-6 shadow-xl space-y-4">
             <h3 className="text-base font-semibold text-slate-900">
-              พบข้อมูล {importedPreview.length} รายการจากแท็บ "{selectedTab}"
+              พบข้อมูล {importedPreview.length} รายการจากแท็บ "{dbConfig.selectedTab}"
             </h3>
             <p className="text-xs text-slate-600">
               เลือกรูปแบบการนำเข้าข้อมูลเข้าสู่บัญชีวัสดุในแอป:
@@ -561,7 +794,8 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
                     {item.name}
                   </span>
                   <span className="font-mono-tabular text-slate-700 shrink-0">
-                    ยกมา {item.beginningQty} / ซื้อ {item.purchasedQty} / ใช้ {item.usedQty}
+                    ยกมา {item.beginningQty} / ซื้อ {item.purchasedQty} / ใช้{' '}
+                    {item.usedQty}
                   </span>
                 </div>
               ))}
@@ -598,8 +832,8 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
                   onSyncSuccess({
                     action: 'นำเข้าข้อมูลจาก Google Sheets',
                     message: successText,
-                    spreadsheetTitle: metadata?.title,
-                    spreadsheetUrl: metadata?.spreadsheetUrl,
+                    spreadsheetTitle: dbConfig.spreadsheetTitle,
+                    spreadsheetUrl: dbConfig.spreadsheetUrl,
                   });
                 }}
                 className="rounded-lg bg-teal-700 px-4 py-2 text-xs font-medium text-white hover:bg-teal-800"

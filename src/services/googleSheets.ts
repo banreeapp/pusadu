@@ -30,6 +30,15 @@ export function extractSpreadsheetId(urlOrId: string): string {
   return trimmed;
 }
 
+export class GoogleSheetsApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'GoogleSheetsApiError';
+    this.status = status;
+  }
+}
+
 async function handleApiResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let message = `Google Sheets API error (${res.status})`;
@@ -41,7 +50,7 @@ async function handleApiResponse<T>(res: Response): Promise<T> {
     } catch {
       // ignore json parse failure
     }
-    throw new Error(message);
+    throw new GoogleSheetsApiError(message, res.status);
   }
   return res.json() as Promise<T>;
 }
@@ -321,7 +330,10 @@ export async function updateExistingSheet(
   );
   await handleApiResponse(clearRes);
 
-  const values = buildLedgerSheetValues(agency, rows, categoryLabel);
+  const values =
+    sheetTitle.trim() === 'ค่าเสื่อมราคาเส้นตรง'
+      ? buildDepreciationSheetValues(agency, rows)
+      : buildLedgerSheetValues(agency, rows, categoryLabel);
   const updateRes = await fetch(
     `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
       spreadsheetId

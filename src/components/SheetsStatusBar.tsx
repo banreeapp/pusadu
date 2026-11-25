@@ -5,17 +5,26 @@ import {
   Clock,
   ExternalLink,
   FileSpreadsheet,
+  Lock,
   RefreshCw,
+  Save,
   X,
 } from 'lucide-react';
-import { AppView, SheetsSyncStatus } from '../types/inventory';
+import {
+  AppView,
+  SheetsDatabaseConfig,
+  SheetsSyncStatus,
+} from '../types/inventory';
 
 interface SheetsStatusBarProps {
   isConnected: boolean;
   userEmail?: string | null;
   syncStatus: SheetsSyncStatus;
+  dbConfig: SheetsDatabaseConfig;
+  countdownSec: number;
   activeView: AppView;
   onNavigateToSheets: () => void;
+  onTriggerManualSave: () => void;
   onClearStatusAlert: () => void;
 }
 
@@ -37,13 +46,21 @@ export const SheetsStatusBar: React.FC<SheetsStatusBarProps> = ({
   isConnected,
   userEmail,
   syncStatus,
+  dbConfig,
+  countdownSec,
   activeView,
   onNavigateToSheets,
+  onTriggerManualSave,
   onClearStatusAlert,
 }) => {
   const isSuccess = syncStatus.kind === 'success';
   const isError = syncStatus.kind === 'error';
   const isSyncing = syncStatus.kind === 'syncing';
+  const isLockedAutoSave =
+    dbConfig.isLocked &&
+    dbConfig.autoSaveEnabled &&
+    Boolean(dbConfig.spreadsheetId) &&
+    Boolean(dbConfig.selectedTab);
 
   const barThemeClass = isError
     ? 'border-red-300 bg-red-50 text-red-950'
@@ -63,6 +80,9 @@ export const SheetsStatusBar: React.FC<SheetsStatusBarProps> = ({
         ? 'bg-sky-500'
         : 'bg-slate-400';
 
+  const targetUrl = dbConfig.spreadsheetUrl || syncStatus.spreadsheetUrl;
+  const targetTitle = dbConfig.spreadsheetTitle || syncStatus.spreadsheetTitle;
+
   return (
     <div
       role="status"
@@ -70,7 +90,7 @@ export const SheetsStatusBar: React.FC<SheetsStatusBarProps> = ({
       className={`border-b px-4 py-2 sm:px-6 transition-colors no-print ${barThemeClass}`}
     >
       <div className="mx-auto flex max-w-[1440px] flex-wrap items-center justify-between gap-x-4 gap-y-1.5 text-xs">
-        {/* Left: Connection + Sync State */}
+        {/* Left: Connection + Lock + Sync State */}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
           <div className="flex items-center gap-2 font-medium shrink-0">
             <span
@@ -107,11 +127,39 @@ export const SheetsStatusBar: React.FC<SheetsStatusBarProps> = ({
             </span>
           </div>
 
+          {dbConfig.isLocked && dbConfig.spreadsheetId && (
+            <span
+              className={`inline-flex items-center gap-1 font-medium ${
+                isError
+                  ? 'text-red-800'
+                  : isSuccess
+                    ? 'text-emerald-800'
+                    : 'text-teal-800'
+              }`}
+            >
+              <Lock className="h-3 w-3 shrink-0" />
+              <span className="truncate max-w-[220px]">
+                ล็อคฐานข้อมูล ({dbConfig.selectedTab || 'ชีตหลัก'})
+              </span>
+              {isLockedAutoSave && (
+                <span className="font-mono-tabular text-[11px] opacity-85">
+                  {isConnected
+                    ? isSyncing
+                      ? '· กำลังบันทึก...'
+                      : `· บันทึกอัตโนมัติใน ${countdownSec} วิ`
+                    : '· รอเข้าสู่ระบบเพื่อบันทึกทุก 60 วิ'}
+                </span>
+              )}
+            </span>
+          )}
+
           {/* Sync Event Feedback */}
           {isSyncing && (
             <span className="inline-flex items-center gap-1.5 text-sky-800 font-medium">
               <RefreshCw className="h-3.5 w-3.5 animate-spin shrink-0" />
-              <span>{syncStatus.message || 'กำลังซิงค์ข้อมูลกับ Google Sheets...'}</span>
+              <span>
+                {syncStatus.message || 'กำลังซิงค์ข้อมูลกับ Google Sheets...'}
+              </span>
             </span>
           )}
 
@@ -135,7 +183,7 @@ export const SheetsStatusBar: React.FC<SheetsStatusBarProps> = ({
         </div>
 
         {/* Right: Last Sync Timestamp & Quick Actions */}
-        <div className="flex flex-wrap items-center gap-3 shrink-0">
+        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
           <div
             className={`inline-flex items-center gap-1.5 font-mono-tabular text-[11px] ${
               isError
@@ -149,16 +197,28 @@ export const SheetsStatusBar: React.FC<SheetsStatusBarProps> = ({
             <span>
               ซิงค์ล่าสุด: {formatThaiSyncTimestamp(syncStatus.lastSyncAt)}
             </span>
-            {syncStatus.spreadsheetTitle && (
-              <span className="hidden md:inline opacity-80 truncate max-w-[180px]">
-                · {syncStatus.spreadsheetTitle}
+            {targetTitle && (
+              <span className="hidden md:inline opacity-80 truncate max-w-[160px]">
+                · {targetTitle}
               </span>
             )}
           </div>
 
-          {syncStatus.spreadsheetUrl && (
+          {isConnected && isLockedAutoSave && (
+            <button
+              type="button"
+              disabled={isSyncing}
+              onClick={onTriggerManualSave}
+              className="inline-flex items-center gap-1 rounded-md border border-teal-300 bg-teal-50 px-2.5 py-1 text-[11px] font-medium text-teal-800 hover:bg-teal-100 disabled:opacity-50 whitespace-nowrap"
+            >
+              <Save className="h-3 w-3" />
+              บันทึกทันที
+            </button>
+          )}
+
+          {targetUrl && (
             <a
-              href={syncStatus.spreadsheetUrl}
+              href={targetUrl}
               target="_blank"
               rel="noreferrer"
               className={`inline-flex items-center gap-1 font-medium underline hover:no-underline whitespace-nowrap ${
@@ -186,7 +246,7 @@ export const SheetsStatusBar: React.FC<SheetsStatusBarProps> = ({
                     : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
               }`}
             >
-              {isConnected ? 'จัดการซิงค์ Sheets' : 'เชื่อมต่อ Google Sheets'}
+              {isConnected ? 'ตั้งค่า Sheets' : 'เชื่อมต่อ Google Sheets'}
             </button>
           )}
 
