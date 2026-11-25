@@ -25,6 +25,7 @@ import {
   MaterialCategory,
   MaterialEntry,
   RequisitionVoucher,
+  SheetsSyncStatus,
   StockMovement,
 } from './types/inventory';
 import {
@@ -67,6 +68,7 @@ import { ConfirmModal } from './components/ConfirmModal';
 import { OfficialPrintReport } from './components/OfficialPrintReport';
 import { CategorySettingsModal } from './components/CategorySettingsModal';
 import { BackupRestoreModal } from './components/BackupRestoreModal';
+import { SheetsStatusBar } from './components/SheetsStatusBar';
 import {
   CategorySummaryReportView,
   PrintableCategorySummaryDocument,
@@ -93,6 +95,7 @@ const STORAGE_KEYS = {
   categories: 'thai_material_ledger_categories_v1',
   requisitions: 'thai_material_ledger_requisitions_v1',
   lastBackup: 'thai_material_ledger_last_backup_v1',
+  sheetsSync: 'thai_material_ledger_sheets_sync_v1',
 };
 
 function loadFromStorage<T>(key: string, fallback: T): T {
@@ -185,6 +188,42 @@ export default function App() {
       return null;
     }
   });
+  const [sheetsSync, setSheetsSync] = useState<SheetsSyncStatus>(() => {
+    const saved = loadFromStorage<{
+      lastSyncAt: string | null;
+      lastSyncAction?: string;
+      spreadsheetTitle?: string;
+      spreadsheetUrl?: string;
+    }>(STORAGE_KEYS.sheetsSync, { lastSyncAt: null });
+    return {
+      kind: 'idle',
+      lastSyncAt: saved.lastSyncAt || null,
+      lastSyncAction: saved.lastSyncAction,
+      spreadsheetTitle: saved.spreadsheetTitle,
+      spreadsheetUrl: saved.spreadsheetUrl,
+    };
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEYS.sheetsSync,
+        JSON.stringify({
+          lastSyncAt: sheetsSync.lastSyncAt,
+          lastSyncAction: sheetsSync.lastSyncAction,
+          spreadsheetTitle: sheetsSync.spreadsheetTitle,
+          spreadsheetUrl: sheetsSync.spreadsheetUrl,
+        })
+      );
+    } catch {
+      // ignore quota errors
+    }
+  }, [
+    sheetsSync.lastSyncAt,
+    sheetsSync.lastSyncAction,
+    sheetsSync.spreadsheetTitle,
+    sheetsSync.spreadsheetUrl,
+  ]);
 
   useEffect(() => {
     try {
@@ -310,6 +349,11 @@ export default function App() {
       if (res) {
         setUser(res.user);
         setNeedsAuth(false);
+        setSheetsSync((prev) => ({
+          ...prev,
+          kind: prev.kind === 'error' ? 'idle' : prev.kind,
+          errorMessage: undefined,
+        }));
       }
     } catch (err: unknown) {
       const code =
@@ -319,6 +363,7 @@ export default function App() {
       const rawMsg =
         err instanceof Error ? err.message : 'ไม่สามารถเข้าสู่ระบบด้วย Google ได้';
 
+      let friendlyMsg = rawMsg;
       if (
         code === 'auth/unauthorized-domain' ||
         rawMsg.includes('unauthorized-domain')
@@ -326,24 +371,26 @@ export default function App() {
         const host =
           typeof window !== 'undefined' ? window.location.hostname : '';
         setUnauthorizedDomain(host);
-        setAuthError(
-          `โดเมน "${host}" ยังไม่ได้รับอนุญาตให้เข้าสู่ระบบใน Firebase Authentication`
-        );
+        friendlyMsg = `โดเมน "${host}" ยังไม่ได้รับอนุญาตให้เข้าสู่ระบบใน Firebase Authentication`;
       } else if (
         code === 'auth/popup-blocked' ||
         rawMsg.includes('popup-blocked')
       ) {
-        setAuthError(
-          'เบราว์เซอร์บล็อกหน้าต่างเข้าสู่ระบบ (Pop-up) กรุณาอนุญาต Pop-up สำหรับเว็บไซต์นี้แล้วลองใหม่อีกครั้ง'
-        );
+        friendlyMsg =
+          'เบราว์เซอร์บล็อกหน้าต่างเข้าสู่ระบบ (Pop-up) กรุณาอนุญาต Pop-up สำหรับเว็บไซต์นี้แล้วลองใหม่อีกครั้ง';
       } else if (
         code === 'auth/popup-closed-by-user' ||
         rawMsg.includes('popup-closed-by-user')
       ) {
-        setAuthError('คุณได้ปิดหน้าต่างเข้าสู่ระบบ Google ก่อนดำเนินการเสร็จสิ้น');
-      } else {
-        setAuthError(rawMsg);
+        friendlyMsg = 'คุณได้ปิดหน้าต่างเข้าสู่ระบบ Google ก่อนดำเนินการเสร็จสิ้น';
       }
+
+      setAuthError(friendlyMsg);
+      setSheetsSync((prev) => ({
+        ...prev,
+        kind: 'error',
+        errorMessage: friendlyMsg,
+      }));
     } finally {
       setIsLoggingIn(false);
     }
@@ -353,6 +400,12 @@ export default function App() {
     await logout();
     setUser(null);
     setNeedsAuth(true);
+    setSheetsSync((prev) => ({
+      ...prev,
+      kind: 'idle',
+      message: undefined,
+      errorMessage: undefined,
+    }));
   };
 
   const handleSaveMaterial = (entry: MaterialEntry) => {
@@ -871,6 +924,22 @@ export default function App() {
             </div>
           </header>
 
+          <SheetsStatusBar
+            isConnected={!needsAuth && Boolean(user)}
+            userEmail={user?.email}
+            syncStatus={sheetsSync}
+            activeView={activeView}
+            onNavigateToSheets={() => setActiveView('sheets')}
+            onClearStatusAlert={() =>
+              setSheetsSync((prev) => ({
+                ...prev,
+                kind: 'idle',
+                message: undefined,
+                errorMessage: undefined,
+              }))
+            }
+          />
+
           <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto space-y-6">
             {authError && (
               <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-800 space-y-2.5">
@@ -1107,6 +1176,50 @@ export default function App() {
                   }
                   setActiveView('ledger');
                 }}
+                onSyncStart={(message) =>
+                  setSheetsSync((prev) => ({
+                    ...prev,
+                    kind: 'syncing',
+                    message,
+                    errorMessage: undefined,
+                  }))
+                }
+                onSyncSuccess={({
+                  action,
+                  message,
+                  spreadsheetTitle,
+                  spreadsheetUrl,
+                }) =>
+                  setSheetsSync((prev) => ({
+                    ...prev,
+                    kind: 'success',
+                    lastSyncAt: new Date().toISOString(),
+                    lastSyncAction: action,
+                    message,
+                    errorMessage: undefined,
+                    spreadsheetTitle:
+                      spreadsheetTitle ?? prev.spreadsheetTitle,
+                    spreadsheetUrl: spreadsheetUrl ?? prev.spreadsheetUrl,
+                  }))
+                }
+                onSyncError={(errorMessage) =>
+                  setSheetsSync((prev) => ({
+                    ...prev,
+                    kind: 'error',
+                    errorMessage,
+                    message: undefined,
+                  }))
+                }
+                onSheetLinked={(spreadsheetTitle, spreadsheetUrl) =>
+                  setSheetsSync((prev) => ({
+                    ...prev,
+                    kind: 'idle',
+                    message: undefined,
+                    errorMessage: undefined,
+                    spreadsheetTitle,
+                    spreadsheetUrl,
+                  }))
+                }
               />
             )}
           </main>

@@ -176,3 +176,16 @@ export type AppView =
   | 'depreciation'
   | 'alerts'
   | 'sheets';
+
+export type SheetsSyncStatusKind = 'idle' | 'syncing' | 'success' | 'error';
+
+export interface SheetsSyncStatus {
+  kind: SheetsSyncStatusKind;
+  lastSyncAt: string | null;
+  lastSyncAction?: string;
+  spreadsheetTitle?: string;
+  spreadsheetUrl?: string;
+  message?: string;
+  errorMessage?: string;
+}
+

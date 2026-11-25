@@ -38,6 +38,15 @@ interface GoogleSheetsSyncViewProps {
   categories: string[];
   selectedCategory: MaterialCategory | 'all';
   onImportEntries: (entries: MaterialEntry[], mode: 'merge' | 'replace') => void;
+  onSyncStart: (message: string) => void;
+  onSyncSuccess: (info: {
+    action: string;
+    message: string;
+    spreadsheetTitle?: string;
+    spreadsheetUrl?: string;
+  }) => void;
+  onSyncError: (errorMessage: string) => void;
+  onSheetLinked: (spreadsheetTitle: string, spreadsheetUrl: string) => void;
 }
 
 export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
@@ -53,6 +62,10 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
   categories,
   selectedCategory,
   onImportEntries,
+  onSyncStart,
+  onSyncSuccess,
+  onSyncError,
+  onSheetLinked,
 }) => {
   const [sheetUrlOrId, setSheetUrlOrId] = useState('');
   const [metadata, setMetadata] = useState<SpreadsheetMetadata | null>(null);
@@ -80,10 +93,13 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
     const token = await getToken();
     if (!token) {
       onRequireReauth();
+      const msg =
+        'กรุณาลงชื่อเข้าใช้ด้วย Google เพื่อรับสิทธิ์เข้าถึง Google Sheets ก่อนดำเนินการ';
       setStatusMessage({
         type: 'error',
-        text: 'กรุณาลงชื่อเข้าใช้ด้วย Google เพื่อรับสิทธิ์เข้าถึง Google Sheets ก่อนดำเนินการ',
+        text: msg,
       });
+      onSyncError(msg);
       return null;
     }
     return token;
@@ -95,6 +111,7 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
 
     setBusyAction('create');
     setStatusMessage(null);
+    onSyncStart('กำลังสร้างสเปรดชีตใหม่และส่งออกข้อมูล...');
     try {
       const result = await createAndExportLedgerSheet(
         token,
@@ -103,14 +120,25 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
         categoryLabel
       );
       setSheetUrlOrId(result.spreadsheetUrl);
+      const successText = `สร้างสเปรดชีต "${result.title}" และส่งออกข้อมูล ${rows.length} รายการเรียบร้อยแล้ว`;
       setStatusMessage({
         type: 'success',
-        text: `สร้างสเปรดชีต "${result.title}" และส่งออกข้อมูล ${rows.length} รายการเรียบร้อยแล้ว`,
+        text: successText,
         link: result.spreadsheetUrl,
       });
+      onSyncSuccess({
+        action: 'สร้างและส่งออก Google Sheets',
+        message: successText,
+        spreadsheetTitle: result.title,
+        spreadsheetUrl: result.spreadsheetUrl,
+      });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'เกิดข้อผิดพลาดในการสร้าง Google Sheet';
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'เกิดข้อผิดพลาดในการสร้าง Google Sheet';
       setStatusMessage({ type: 'error', text: message });
+      onSyncError(message);
     } finally {
       setBusyAction(null);
     }
@@ -118,10 +146,12 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
 
   const handleLoadMetadata = async () => {
     if (!sheetUrlOrId.trim()) {
+      const msg = 'กรุณาวางลิงก์ Google Sheets หรือรหัส Spreadsheet ID';
       setStatusMessage({
         type: 'error',
-        text: 'กรุณาวางลิงก์ Google Sheets หรือรหัส Spreadsheet ID',
+        text: msg,
       });
+      onSyncError(msg);
       return;
     }
     const token = await ensureToken();
@@ -129,6 +159,7 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
 
     setBusyAction('inspect');
     setStatusMessage(null);
+    onSyncStart('กำลังตรวจสอบโครงสร้างไฟล์ Google Sheets...');
     try {
       const meta = await getSpreadsheetMetadata(token, sheetUrlOrId);
       setMetadata(meta);
@@ -138,10 +169,14 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
         text: `พบสเปรดชีต "${meta.title}" (${meta.sheets.length} แท็บ)`,
         link: meta.spreadsheetUrl,
       });
+      onSheetLinked(meta.title, meta.spreadsheetUrl);
     } catch (err: unknown) {
       const message =
-        err instanceof Error ? err.message : 'ไม่สามารถอ่านข้อมูลสเปรดชีตได้';
+        err instanceof Error
+          ? err.message
+          : 'ไม่สามารถอ่านข้อมูลสเปรดชีตได้';
       setStatusMessage({ type: 'error', text: message });
+      onSyncError(message);
       setMetadata(null);
     } finally {
       setBusyAction(null);
@@ -155,6 +190,7 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
 
     setBusyAction('overwrite');
     setStatusMessage(null);
+    onSyncStart(`กำลังอัปเดตข้อมูลลงแท็บ "${selectedTab}"...`);
     try {
       await updateExistingSheet(
         token,
@@ -165,15 +201,23 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
         categoryLabel
       );
       setConfirmOverwriteOpen(false);
+      const successText = `อัปเดตข้อมูลบัญชีวัสดุ (${rows.length} รายการ) ลงในแท็บ "${selectedTab}" ของ "${metadata.title}" สำเร็จแล้ว`;
       setStatusMessage({
         type: 'success',
-        text: `อัปเดตข้อมูลบัญชีวัสดุ (${rows.length} รายการ) ลงในแท็บ "${selectedTab}" ของ "${metadata.title}" สำเร็จแล้ว`,
+        text: successText,
         link: metadata.spreadsheetUrl,
+      });
+      onSyncSuccess({
+        action: 'อัปเดตข้อมูลลง Google Sheets',
+        message: successText,
+        spreadsheetTitle: metadata.title,
+        spreadsheetUrl: metadata.spreadsheetUrl,
       });
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'ไม่สามารถอัปเดต Google Sheet ได้';
       setStatusMessage({ type: 'error', text: message });
+      onSyncError(message);
     } finally {
       setBusyAction(null);
     }
@@ -186,6 +230,7 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
 
     setBusyAction('import');
     setStatusMessage(null);
+    onSyncStart(`กำลังดึงข้อมูลจากแท็บ "${selectedTab}"...`);
     try {
       const parsed = await importFromGoogleSheet(
         token,
@@ -193,18 +238,24 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
         selectedTab
       );
       if (parsed.length === 0) {
+        const msg = `ไม่พบแถวรายการวัสดุในแท็บ "${selectedTab}" กรุณาตรวจสอบหัวตาราง (รหัสวัสดุ, รายการ)`;
         setStatusMessage({
           type: 'error',
-          text: `ไม่พบแถวรายการวัสดุในแท็บ "${selectedTab}" กรุณาตรวจสอบหัวตาราง (รหัสวัสดุ, รายการ)`,
+          text: msg,
         });
+        onSyncError(msg);
       } else {
         setImportedPreview(parsed);
         setConfirmImportOpen(true);
+        onSheetLinked(metadata.title, metadata.spreadsheetUrl);
       }
     } catch (err: unknown) {
       const message =
-        err instanceof Error ? err.message : 'ไม่สามารถนำเข้าข้อมูลจาก Google Sheet ได้';
+        err instanceof Error
+          ? err.message
+          : 'ไม่สามารถนำเข้าข้อมูลจาก Google Sheet ได้';
       setStatusMessage({ type: 'error', text: message });
+      onSyncError(message);
     } finally {
       setBusyAction(null);
     }
@@ -535,12 +586,20 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
               <button
                 type="button"
                 onClick={() => {
+                  const importedCount = importedPreview.length;
                   onImportEntries(importedPreview, importMode);
                   setConfirmImportOpen(false);
                   setImportedPreview(null);
+                  const successText = `นำเข้าข้อมูลจำนวน ${importedCount} รายการเข้าสู่บัญชีเรียบร้อยแล้ว`;
                   setStatusMessage({
                     type: 'success',
-                    text: `นำเข้าข้อมูลจำนวน ${importedPreview.length} รายการเข้าสู่บัญชีเรียบร้อยแล้ว`,
+                    text: successText,
+                  });
+                  onSyncSuccess({
+                    action: 'นำเข้าข้อมูลจาก Google Sheets',
+                    message: successText,
+                    spreadsheetTitle: metadata?.title,
+                    spreadsheetUrl: metadata?.spreadsheetUrl,
                   });
                 }}
                 className="rounded-lg bg-teal-700 px-4 py-2 text-xs font-medium text-white hover:bg-teal-800"
