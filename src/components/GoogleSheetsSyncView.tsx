@@ -1,8 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { User } from 'firebase/auth';
 import {
+  Check,
   CheckCircle2,
   Clock,
+  Copy,
   Database,
   Download,
   ExternalLink,
@@ -10,6 +12,7 @@ import {
   FolderSearch,
   Lock,
   LogOut,
+  PauseCircle,
   RefreshCw,
   Save,
   Unlock,
@@ -107,6 +110,8 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
   );
   const [confirmImportOpen, setConfirmImportOpen] = useState(false);
   const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge');
+  const [copiedSheetId, setCopiedSheetId] = useState(false);
+  const autoCheckedOnLoginRef = useRef<string>('');
 
   useEffect(() => {
     if (dbConfig.spreadsheetUrl && dbConfig.spreadsheetUrl !== sheetUrlInput) {
@@ -176,9 +181,10 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
           { sheetId: 0, title: 'แบบบัญชีวัสดุประจำปี' },
           { sheetId: 1, title: 'ค่าเสื่อมราคาเส้นตรง' },
         ],
+        isLocked: true,
       }));
 
-      const successText = `สร้างฐานข้อมูล "${result.title}" และส่งออกข้อมูล ${allRows.length} รายการเรียบร้อยแล้ว (พร้อมล็อคการตั้งค่า)`;
+      const successText = `สร้างฐานข้อมูล "${result.title}" และส่งออกข้อมูล ${allRows.length} รายการ พร้อมล็อคการตั้งค่า Google Sheet ID เรียบร้อยแล้ว`;
       setStatusMessage({
         type: 'success',
         text: successText,
@@ -225,11 +231,12 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
         spreadsheetTitle: meta.title,
         availableTabs: meta.sheets,
         selectedTab: defaultTab,
+        isLocked: true,
       }));
 
       setStatusMessage({
         type: 'success',
-        text: `เชื่อมต่อไฟล์ "${meta.title}" สำเร็จ (${meta.sheets.length} แท็บ) — สามารถกด "ล็อคการตั้งค่า" ได้ทันที`,
+        text: `เชื่อมต่อไฟล์ "${meta.title}" สำเร็จ (${meta.sheets.length} แท็บ) และล็อคการตั้งค่า Google Sheet ID แล้ว`,
         link: meta.spreadsheetUrl,
       });
       onSheetLinked(meta.title, meta.spreadsheetUrl);
@@ -240,7 +247,36 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
     }
   };
 
-  const handleConfirmLockSettings = async () => {
+  // If user pasted a Sheet ID/URL before logging in, verify & auto-lock it once logged in
+  useEffect(() => {
+    const candidateId = extractSpreadsheetId(sheetUrlInput);
+    if (
+      !needsAuth &&
+      user &&
+      !dbConfig.spreadsheetId &&
+      !dbConfig.isLocked &&
+      candidateId &&
+      busyAction === null &&
+      autoCheckedOnLoginRef.current !== candidateId
+    ) {
+      autoCheckedOnLoginRef.current = candidateId;
+      void handleLoadMetadata();
+    }
+  }, [needsAuth, user, dbConfig.spreadsheetId, dbConfig.isLocked, sheetUrlInput, busyAction]);
+
+  const handleLockSheetIdOnly = () => {
+    if (needsAuth || !user || !hasLinkedSheet) return;
+    onUpdateDbConfig((prev) => ({
+      ...prev,
+      isLocked: true,
+    }));
+    setStatusMessage({
+      type: 'success',
+      text: `ล็อคการตั้งค่า Google Sheet ID (${dbConfig.spreadsheetId}) เรียบร้อยแล้ว`,
+    });
+  };
+
+  const handleConfirmEnableAutoSave = async () => {
     if (!hasLinkedSheet) return;
     setConfirmLockOpen(false);
     onUpdateDbConfig((prev) => ({
@@ -252,6 +288,17 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
     await onTriggerSaveNow();
   };
 
+  const handlePauseAutoSave = () => {
+    onUpdateDbConfig((prev) => ({
+      ...prev,
+      autoSaveEnabled: false,
+    }));
+    setStatusMessage({
+      type: 'success',
+      text: 'หยุดการบันทึกอัตโนมัติทุก 60 วินาทีชั่วคราวแล้ว (Google Sheet ID ยังคงล็อคอยู่)',
+    });
+  };
+
   const handleUnlockSettings = () => {
     onUpdateDbConfig((prev) => ({
       ...prev,
@@ -260,7 +307,7 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
     }));
     setStatusMessage({
       type: 'success',
-      text: 'ปลดล็อคการตั้งค่าและหยุดการบันทึกอัตโนมัติทุก 60 วินาทีแล้ว',
+      text: 'ปลดล็อคการตั้งค่า Google Sheet ID และหยุดการบันทึกอัตโนมัติแล้ว',
     });
   };
 
@@ -465,51 +512,118 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
 
           {dbConfig.isLocked ? (
             <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={() => void onTriggerSaveNow()}
-                disabled={needsAuth || isAutoSaving || busyAction !== null}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-50"
-              >
-                <Save className="h-3.5 w-3.5" />
-                {isAutoSaving ? 'กำลังบันทึก...' : 'บันทึกลง Sheets ทันที'}
-              </button>
+              {dbConfig.autoSaveEnabled ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void onTriggerSaveNow()}
+                    disabled={needsAuth || isAutoSaving || busyAction !== null}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-50"
+                  >
+                    <Save className="h-3.5 w-3.5" />
+                    {isAutoSaving ? 'กำลังบันทึก...' : 'บันทึกลง Sheets ทันที'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handlePauseAutoSave}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    <PauseCircle className="h-3.5 w-3.5 text-slate-600" />
+                    หยุดบันทึกอัตโนมัติ
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmLockOpen(true)}
+                  disabled={needsAuth || !hasLinkedSheet || busyAction !== null}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-50"
+                >
+                  <Clock className="h-3.5 w-3.5" />
+                  เปิดบันทึกอัตโนมัติทุก 60 วินาที
+                </button>
+              )}
               <button
                 type="button"
                 onClick={handleUnlockSettings}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-3.5 py-2 text-xs font-semibold text-amber-900 hover:bg-amber-100"
               >
                 <Unlock className="h-3.5 w-3.5" />
-                ปลดล็อคการตั้งค่า
+                ปลดล็อค Google Sheet ID
               </button>
             </div>
           ) : (
-            <button
-              type="button"
-              onClick={() => setConfirmLockOpen(true)}
-              disabled={needsAuth || !hasLinkedSheet || busyAction !== null}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-4 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-50"
-            >
-              <Lock className="h-3.5 w-3.5" />
-              ล็อคการตั้งค่า (บันทึกทุก 60 วินาที)
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              {hasLinkedSheet && !needsAuth && user && (
+                <button
+                  type="button"
+                  onClick={handleLockSheetIdOnly}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-teal-700 bg-white px-3.5 py-2 text-xs font-semibold text-teal-700 hover:bg-teal-50"
+                >
+                  <Lock className="h-3.5 w-3.5" />
+                  ล็อค Google Sheet ID
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setConfirmLockOpen(true)}
+                disabled={needsAuth || !hasLinkedSheet || busyAction !== null}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-teal-700 px-4 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-50"
+              >
+                <Lock className="h-3.5 w-3.5" />
+                ล็อค &amp; บันทึกทุก 60 วินาที
+              </button>
+            </div>
           )}
         </div>
 
         {/* Locked Status Banner */}
         {dbConfig.isLocked && (
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-teal-200 bg-white px-4 py-3 text-xs">
-            <div className="flex items-center gap-2.5 text-teal-900">
-              <Lock className="h-4 w-4 text-teal-700 shrink-0" />
+            <div className="flex items-start gap-2.5 text-teal-900">
+              <Lock className="h-4 w-4 text-teal-700 shrink-0 mt-0.5" />
               <div>
                 <div className="font-semibold">
-                  ล็อคการตั้งค่าฐานข้อมูลแล้ว — {dbConfig.spreadsheetTitle} (แท็บ:{' '}
+                  ล็อคการตั้งค่า Google Sheet ID แล้ว — {dbConfig.spreadsheetTitle} (แท็บ:{' '}
                   {dbConfig.selectedTab})
                 </div>
-                <div className="text-[11px] text-slate-600 mt-0.5">
+                <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-600">
+                  <span>Google Sheet ID:</span>
+                  <code className="rounded border border-slate-200 bg-slate-50 px-2 py-0.5 font-mono-tabular text-slate-900 select-all">
+                    {dbConfig.spreadsheetId}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(dbConfig.spreadsheetId);
+                        setCopiedSheetId(true);
+                        setTimeout(() => setCopiedSheetId(false), 2000);
+                      } catch {
+                        // ignore clipboard failure
+                      }
+                    }}
+                    className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    {copiedSheetId ? (
+                      <>
+                        <Check className="h-3 w-3 text-emerald-600" />
+                        คัดลอกแล้ว
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="h-3 w-3" />
+                        คัดลอก ID
+                      </>
+                    )}
+                  </button>
+                </div>
+                <div className="text-[11px] text-slate-500 mt-1">
                   {needsAuth || !user
-                    ? 'กรุณาเข้าสู่ระบบ Google ด้านบน เพื่อเริ่มการทำงานบันทึกอัตโนมัติทุก 60 วินาที'
-                    : `ระบบบันทึกข้อมูลบัญชีวัสดุทั้งหมด (${allRows.length} รายการ) ลงแท็บ "${dbConfig.selectedTab}" อัตโนมัติทุก 60 วินาที`}
+                    ? 'กรุณาเข้าสู่ระบบ Google ด้านบน เพื่อใช้งานการบันทึกข้อมูลลง Sheets'
+                    : dbConfig.autoSaveEnabled
+                      ? `ระบบบันทึกข้อมูลบัญชีวัสดุทั้งหมด (${allRows.length} รายการ) ลงแท็บ "${dbConfig.selectedTab}" อัตโนมัติทุก 60 วินาที`
+                      : 'Google Sheet ID ถูกล็อคไว้ป้องกันการแก้ไขโดยไม่ตั้งใจ (กด "เปิดบันทึกอัตโนมัติทุก 60 วินาที" เพื่อเริ่มซิงค์อัตโนมัติ)'}
                 </div>
               </div>
             </div>
@@ -547,11 +661,15 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
                 <FolderSearch className="h-4 w-4 text-teal-700" />
                 เชื่อมต่อไฟล์ Google Sheets ที่มีอยู่
               </div>
-              {dbConfig.isLocked && (
+              {dbConfig.isLocked ? (
                 <span className="inline-flex items-center gap-1 text-[11px] font-medium text-teal-700">
-                  <Lock className="h-3 w-3" /> ล็อคอยู่
+                  <Lock className="h-3 w-3" /> ล็อค Google Sheet ID แล้ว
                 </span>
-              )}
+              ) : !needsAuth && user ? (
+                <span className="text-[11px] text-slate-500">
+                  เมื่อตรวจสอบไฟล์สำเร็จ ระบบจะล็อค Sheet ID ให้อัตโนมัติ
+                </span>
+              ) : null}
             </div>
 
             <div className="flex gap-2">
@@ -560,7 +678,7 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
                 value={sheetUrlInput}
                 disabled={dbConfig.isLocked}
                 onChange={(e) => setSheetUrlInput(e.target.value)}
-                placeholder="https://docs.google.com/spreadsheets/d/..."
+                placeholder="วางลิงก์ URL หรือรหัส Google Sheet ID..."
                 className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-mono-tabular focus:border-teal-600 focus:outline-none disabled:bg-slate-100 disabled:text-slate-500"
               />
               <button
@@ -711,21 +829,22 @@ export const GoogleSheetsSyncView: React.FC<GoogleSheetsSyncViewProps> = ({
         </div>
       )}
 
-      {/* Mandatory Confirmation before locking & enabling 60s Auto-Save */}
+      {/* Mandatory Confirmation before enabling 60s Auto-Save */}
       <ConfirmModal
         open={confirmLockOpen}
-        title="ยืนยันการล็อคการตั้งค่าและบันทึกอัตโนมัติทุก 60 วินาที?"
-        description={`เมื่อยืนยันล็อคการตั้งค่า ระบบจะล็อคการเชื่อมต่อกับสเปรดชีต "${dbConfig.spreadsheetTitle}" และบันทึกข้อมูลบัญชีวัสดุปัจจุบันลงแท็บ "${dbConfig.selectedTab}" อัตโนมัติทุก 60 วินาที`}
+        title="ยืนยันการเปิดบันทึกอัตโนมัติลง Google Sheets ทุก 60 วินาที?"
+        description={`ระบบจะล็อค Google Sheet ID (${dbConfig.spreadsheetId}) และบันทึกข้อมูลบัญชีวัสดุปัจจุบันลงแท็บ "${dbConfig.selectedTab}" ของไฟล์ "${dbConfig.spreadsheetTitle}" อัตโนมัติทุก 60 วินาที`}
         details={[
+          `Google Sheet ID: ${dbConfig.spreadsheetId || '-'}`,
           `ไฟล์ฐานข้อมูล: ${dbConfig.spreadsheetTitle || '-'}`,
           `แท็บปลายทาง: ${dbConfig.selectedTab || '-'}`,
           `จำนวนข้อมูลที่จะบันทึก: ${allRows.length} รายการ (ทุกหมวดหมู่)`,
-          'สามารถกด "ปลดล็อคการตั้งค่า" ได้ทุกเมื่อเพื่อหยุดการบันทึกอัตโนมัติหรือเปลี่ยนไฟล์',
+          'สามารถกด "หยุดบันทึกอัตโนมัติ" หรือ "ปลดล็อค Google Sheet ID" ได้ทุกเมื่อ',
         ]}
-        confirmLabel="ยืนยันล็อคและเปิดบันทึกทุก 60 วิ"
+        confirmLabel="ยืนยันเปิดบันทึกทุก 60 วินาที"
         cancelLabel="ยกเลิก"
         tone="warning"
-        onConfirm={() => void handleConfirmLockSettings()}
+        onConfirm={() => void handleConfirmEnableAutoSave()}
         onCancel={() => setConfirmLockOpen(false)}
       />
 

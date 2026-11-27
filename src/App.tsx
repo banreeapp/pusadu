@@ -312,10 +312,16 @@ export default function App() {
       (authedUser) => {
         setUser(authedUser);
         setNeedsAuth(false);
+        setSheetsDbConfig((prev) =>
+          prev.spreadsheetId ? { ...prev, isLocked: true } : prev
+        );
       },
       () => {
         setUser(null);
         setNeedsAuth(true);
+        setSheetsDbConfig((prev) =>
+          prev.isLocked ? { ...prev, isLocked: false } : prev
+        );
       }
     );
     return () => unsubscribe();
@@ -521,6 +527,9 @@ export default function App() {
       if (res) {
         setUser(res.user);
         setNeedsAuth(false);
+        setSheetsDbConfig((prev) =>
+          prev.spreadsheetId ? { ...prev, isLocked: true } : prev
+        );
         setSheetsSync((prev) => ({
           ...prev,
           kind: prev.kind === 'error' ? 'idle' : prev.kind,
@@ -572,6 +581,11 @@ export default function App() {
     await logout();
     setUser(null);
     setNeedsAuth(true);
+    setSheetsDbConfig((prev) => ({
+      ...prev,
+      isLocked: false,
+      autoSaveEnabled: false,
+    }));
     setSheetsSync((prev) => ({
       ...prev,
       kind: 'idle',
